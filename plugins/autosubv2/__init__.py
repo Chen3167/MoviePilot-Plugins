@@ -461,30 +461,38 @@ class AutoSubv2(_PluginBase):
         刷新媒体服务器中视频所在的媒体库
         :param video_file: 视频文件路径
         """
+        logger.info(f"[刷新检查] refresh_enabled={self._refresh_enabled}, mediaservers={self._mediaservers}")
         if not self._refresh_enabled or not self._mediaservers:
+            logger.info(f"刷新媒体库未启用或未配置媒体服务器，跳过刷新")
             return
         try:
+            logger.info(f"开始刷新媒体服务器，视频路径: {video_file}")
             services = MediaServerHelper().get_services(name_filters=self._mediaservers)
             if not services:
                 logger.warning("获取媒体服务器实例失败，请检查配置")
                 return
+            logger.info(f"获取到 {len(services)} 个媒体服务器: {list(services.keys())}")
             item = RefreshMediaItem(
                 target_path=Path(video_file).parent,
             )
+            logger.info(f"刷新目标路径: {item.target_path}")
             for name, service in services.items():
                 if service.instance.is_inactive():
                     logger.warning(f"媒体服务器 {name} 未连接，跳过刷新")
                     continue
                 if hasattr(service.instance, 'refresh_library_by_items'):
-                    logger.info(f"刷新媒体服务器 {name} ...")
+                    logger.info(f"调用 {name}.refresh_library_by_items() ...")
                     service.instance.refresh_library_by_items([item])
+                    logger.info(f"媒体服务器 {name} 刷新完成")
                 elif hasattr(service.instance, 'refresh_root_library'):
-                    logger.info(f"刷新媒体服务器 {name} 根媒体库 ...")
+                    logger.info(f"调用 {name}.refresh_root_library() ...")
                     service.instance.refresh_root_library()
+                    logger.info(f"媒体服务器 {name} 根媒体库刷新完成")
                 else:
                     logger.warning(f"媒体服务器 {name} 不支持刷新")
         except Exception as e:
             logger.error(f"刷新媒体服务器失败：{e}")
+            logger.error(traceback.format_exc())
 
     def __do_speech_recognition(self, audio_lang, audio_file):
         """
