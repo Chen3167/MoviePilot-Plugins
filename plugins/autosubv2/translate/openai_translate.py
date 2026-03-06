@@ -115,6 +115,44 @@ class OpenAi:
         if OpenAISessionCache.get(session_id):
             OpenAISessionCache.delete(session_id)
 
+    def translate_to_zh_batch(self, text: str, context: str = None, max_retries: int = 3):
+        """
+        批量翻译为中文（编号标记格式）
+        :param text: 编号标记格式的输入文本，如 [1] xxx\n[2] yyy
+        :param context: 翻译上下文
+        :param max_retries: 最大重试次数
+        """
+        system_prompt = """您是一位专业字幕翻译专家，请严格遵循以下规则：
+1. 将原文精准翻译为简体中文，保持原文本意
+2. 使用自然的口语化表达，符合中文观影习惯
+3. 结合上下文语境，人物称谓、专业术语、情感语气在上下文中保持连贯
+4. 输入格式为 [编号] 原文，每条占一行
+5. 输出格式必须严格为：[编号] 译文。每条占一行，不要合并或拆分条目
+6. 保持编号与原文一一对应，不要遗漏或添加条目
+7. 输出内容必须仅包括译文。不要输出任何开场白，解释说明或总结"""
+        user_prompt = f"翻译上下文：\n{context}\n\n需要翻译的内容：\n{text}" if context else f"请翻译：\n{text}"
+
+        last_error = ""
+        for attempt in range(max_retries + 1):
+            try:
+                completion = self.__get_model(prompt=system_prompt,
+                                              message=user_prompt,
+                                              temperature=0.2,
+                                              top_p=0.9)
+                result = completion.choices[0].message.content.strip()
+                return True, result
+            except Exception as e:
+                last_error = str(e)
+                if attempt < max_retries:
+                    base_delay = 2 ** attempt
+                    jitter = random.uniform(0.1, 0.9)
+                    sleep_time = base_delay + jitter
+                    print(f"批量翻译请求失败 (第{attempt + 1}次尝试)：{last_error}，{sleep_time:.1f}秒后重试...")
+                    time.sleep(sleep_time)
+                else:
+                    print(f"批量翻译请求失败 (已重试{max_retries}次)：{last_error}")
+                    return False, f"{last_error}"
+
     def translate_to_zh(self, text: str, context: str = None, max_retries: int = 3):
         """
         翻译为中文

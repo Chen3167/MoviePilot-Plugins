@@ -14,12 +14,15 @@ from lxml import etree
 from dataclasses import dataclass
 from enum import Enum
 import queue
+import re
 import threading
+from typing import Optional
 from uuid import uuid4
 from app.core.config import settings
 from app.core.context import MediaInfo
 from app.core.event import eventmanager, Event as MPEvent
-from app.schemas import TransferInfo
+from app.helper.mediaserver import MediaServerHelper
+from app.schemas import TransferInfo, RefreshMediaItem, ServiceInfo
 from app.schemas.types import NotificationType, EventType
 from app.log import logger
 from app.plugins import _PluginBase
@@ -78,6 +81,10 @@ class AutoSubv2(_PluginBase):
     # 可使用的用户级别
     auth_level = 2
 
+    # 中文语言代码集合（ISO 639-1/2/3 及常见变体）
+    CHINESE_LANGS = {'zh', 'chi', 'zho', 'zh-CN', 'zh-TW', 'zh-Hans', 'zh-Hant',
+                     'chs', 'cht', 'zhs', 'zht', 'zhong', 'simp', 'cn'}
+
     # 私有属性
     _tasks: Dict[str, TaskItem] = None
     _task_queue = None
@@ -105,6 +112,8 @@ class AutoSubv2(_PluginBase):
     _huggingface_proxy = None
     _faster_whisper_model_path = None
     _faster_whisper_model = None
+    _refresh_enabled = None
+    _mediaservers = None
 
     def init_plugin(self, config=None):
         # 如果没有配置信息， 则不处理
@@ -162,6 +171,10 @@ class AutoSubv2(_PluginBase):
             self._context_window = int(config.get('context_window')) if config.get('context_window') else 5
             self._max_retries = int(config.get('max_retries')) if config.get('max_retries') else 3
             self._enable_merge = config.get('enable_merge', False)
+
+        # 媒体库刷新设置
+        self._refresh_enabled = config.get('refresh_enabled', False)
+        self._mediaservers = config.get('mediaservers') or []
 
         if self._clear_history:
             config['clear_history'] = False
@@ -222,22 +235,47 @@ class AutoSubv2(_PluginBase):
         tasks_dict = {task_id: self._serialize_task(task) for task_id, task in self._tasks.items()}
         self.save_data("tasks", tasks_dict)
 
+    def __has_chinese_subtitle(self, video_file: str) -> bool:
+        """
+        检查视频是否已有中文字幕（外挂或内嵌）
+        :param video_file: 视频文件路径
+        :return: 存在中文字幕返回True
+        """
+        # 检查外挂中文字幕
+        exist, lang, _ = self.__external_subtitle_exists(video_file, list(self.CHINESE_LANGS), strict=True)
+        if exist:
+            logger.info(f"已存在中文外挂字幕（{lang}），跳过：{video_file}")
+            return True
+        # 检查内嵌中文字幕
+        video_meta = Ffmpeg().get_video_metadata(video_file)
+        if video_meta:
+            ret, _, sub_lang = self.__get_video_prefer_subtitle(video_meta, list(self.CHINESE_LANGS),
+                                                                strict=True, only_srt=False)
+            if ret and sub_lang in self.CHINESE_LANGS:
+                logger.info(f"已存在中文内嵌字幕（{sub_lang}），跳过：{video_file}")
+                return True
+        return False
+
     def add_task(self, video_file: str, source: TaskSource):
         """
         添加新任务到队列和任务列表中，若任务已存在则跳过。
         :param video_file: 视频文件路径
         :param source: 任务来源（手动/事件）
         """
+        if self.__is_duplicate_task(video_file):
+            logger.info(f"任务已存在，跳过添加：{video_file}")
+            return False
+
+        # 已有中文字幕的视频不加入任务队列
+        if self.__has_chinese_subtitle(video_file):
+            return False
+
         task = TaskItem(
             task_id=str(uuid4()),
             video_file=video_file,
             source=source,
             add_time=datetime.now()
         )
-
-        if self.__is_duplicate_task(task.video_file):
-            logger.info(f"任务已存在，跳过添加：{video_file}")
-            return False
 
         self._task_queue.put(task)
         self._tasks[task.task_id] = task
@@ -297,8 +335,7 @@ class AutoSubv2(_PluginBase):
         item_media: MediaInfo = item.get("mediainfo")
         logger.info(f"监听到媒体入库事件：{item_media.title}")
         origin_lang = item_media.original_language
-        prefer_langs = ['zh', 'chi', 'zh-CN', 'chs', 'zhs', 'zh-Hans', 'zhong', 'simp', 'cn']
-        if origin_lang in prefer_langs:
+        if origin_lang in self.CHINESE_LANGS:
             logger.info(f"媒体原始语言为中文，跳过处理")
             return
 
@@ -361,10 +398,13 @@ class AutoSubv2(_PluginBase):
                 return TaskStatus.FAILED
 
             if self._translate_zh:
-                # 翻译字幕
-                logger.info(f"开始翻译字幕为中文 ...")
-                self.__translate_zh_subtitle(lang, gen_sub_path, f"{file_path}.zh.机翻.srt")
-                logger.info(f"翻译字幕完成：{file_name}.zh.机翻.srt")
+                if lang in self.CHINESE_LANGS:
+                    logger.info(f"字幕语言已经是中文（{lang}），跳过翻译")
+                else:
+                    # 翻译字幕
+                    logger.info(f"开始翻译字幕为中文 ...")
+                    self.__translate_zh_subtitle(lang, gen_sub_path, f"{file_path}.zh.机翻.srt")
+                    logger.info(f"翻译字幕完成：{file_name}.zh.机翻.srt")
 
             end_time = time.time()
             message = f" 媒体: {file_name}\n 处理完成\n 字幕原始语言: {lang}\n "
@@ -374,6 +414,8 @@ class AutoSubv2(_PluginBase):
             logger.info(f"自动字幕生成 处理完成：{message}")
             if self._send_notify:
                 self.post_message(mtype=NotificationType.Plugin, title="【自动字幕生成】", text=message)
+            # 刷新媒体服务器
+            self.__refresh_mediaserver(video_file)
             return TaskStatus.COMPLETED
         except UserInterruptException:
             logger.info(f"用户中断当前任务：{video_file}")
@@ -387,6 +429,36 @@ class AutoSubv2(_PluginBase):
             # 打印调用栈
             logger.error(traceback.format_exc())
             return TaskStatus.FAILED
+
+    def __refresh_mediaserver(self, video_file: str):
+        """
+        刷新媒体服务器中视频所在的媒体库
+        :param video_file: 视频文件路径
+        """
+        if not self._refresh_enabled or not self._mediaservers:
+            return
+        try:
+            services = MediaServerHelper().get_services(name_filters=self._mediaservers)
+            if not services:
+                logger.warning("获取媒体服务器实例失败，请检查配置")
+                return
+            item = RefreshMediaItem(
+                target_path=Path(video_file).parent,
+            )
+            for name, service in services.items():
+                if service.instance.is_inactive():
+                    logger.warning(f"媒体服务器 {name} 未连接，跳过刷新")
+                    continue
+                if hasattr(service.instance, 'refresh_library_by_items'):
+                    logger.info(f"刷新媒体服务器 {name} ...")
+                    service.instance.refresh_library_by_items([item])
+                elif hasattr(service.instance, 'refresh_root_library'):
+                    logger.info(f"刷新媒体服务器 {name} 根媒体库 ...")
+                    service.instance.refresh_root_library()
+                else:
+                    logger.warning(f"媒体服务器 {name} 不支持刷新")
+        except Exception as e:
+            logger.error(f"刷新媒体服务器失败：{e}")
 
     def __do_speech_recognition(self, audio_lang, audio_file):
         """
@@ -834,17 +906,22 @@ class AutoSubv2(_PluginBase):
         return self._openai.translate_to_zh(text, context, max_retries=self._max_retries)
 
     def __process_batch(self, all_subs: list, batch: list) -> list:
-        """批量处理逻辑"""
+        """批量处理逻辑（使用编号标记格式）"""
         indices = [all_subs.index(item) for item in batch]
         context = self.__get_context(all_subs, indices, is_batch=True) if self._context_window > 0 else None
-        batch_text = '\n'.join([item.content for item in batch])
+        # 使用编号标记格式，字幕内换行替换为空格，避免行数不匹配
+        numbered_lines = []
+        for i, item in enumerate(batch, 1):
+            content = item.content.replace('\n', ' ').strip()
+            numbered_lines.append(f"[{i}] {content}")
+        batch_text = '\n'.join(numbered_lines)
 
         try:
-            ret, result = self.__translate_to_zh(batch_text, context)
+            ret, result = self.__translate_to_zh_batch(batch_text, context)
             if not ret:
                 raise Exception(result)
 
-            translated = [line.strip() for line in result.split('\n') if line.strip()]
+            translated = self.__parse_numbered_result(result, len(batch))
             if len(translated) != len(batch):
                 raise Exception(f"批次行数不匹配 {len(translated)}/{len(batch)}")
 
@@ -856,6 +933,25 @@ class AutoSubv2(_PluginBase):
             logger.warning(f"批次翻译失败（{str(e)}），降级到单行匹配...")
             self._stats['batch_fail'] += 1
             return [self.__process_single(all_subs, item) for item in batch]
+
+    def __translate_to_zh_batch(self, text: str, context: str = None) -> tuple:
+        """批量翻译（使用编号标记格式）"""
+        if self._event.is_set():
+            raise UserInterruptException("用户中断当前任务")
+        return self._openai.translate_to_zh_batch(text, context, max_retries=self._max_retries)
+
+    @staticmethod
+    def __parse_numbered_result(result: str, expected_count: int) -> list:
+        """解析编号标记格式的翻译结果"""
+        parsed = {}
+        pattern = re.compile(r'\[(\d+)\]\s*(.*?)(?=\n\[\d+\]|\Z)', re.DOTALL)
+        for match in pattern.finditer(result):
+            idx = int(match.group(1))
+            content = match.group(2).strip()
+            if 1 <= idx <= expected_count:
+                parsed[idx] = content
+        # 按编号顺序返回
+        return [parsed.get(i, "") for i in range(1, expected_count + 1) if i in parsed]
 
     def __process_single(self, all_subs: List[srt.Subtitle], item: srt.Subtitle) -> srt.Subtitle:
         """单条处理逻辑"""
@@ -1004,7 +1100,7 @@ class AutoSubv2(_PluginBase):
         :return:
         """
         if self._translate_zh:
-            prefer_langs = ['zh', 'chi', 'zh-CN', 'chs', 'zhs', 'zh-Hans', 'zhong', 'simp', 'cn']
+            prefer_langs = list(self.CHINESE_LANGS)
             strict = True
         else:
             if self._translate_preference == "english_first":
@@ -1253,6 +1349,43 @@ class AutoSubv2(_PluginBase):
                                             'model': 'proxy',
                                             'hint': '需配置MP环境变量PROXY_HOST',
                                             'label': '使用代理下载模型'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'refresh_enabled',
+                                            'label': '完成后刷新媒体库',
+                                            'hint': '字幕生成完成后自动刷新媒体服务器'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 8},
+                                'content': [
+                                    {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'model': 'mediaservers',
+                                            'label': '媒体服务器',
+                                            'multiple': True,
+                                            'chips': True,
+                                            'clearable': True,
+                                            'items': [{"title": config.name, "value": config.name}
+                                                      for config in MediaServerHelper().get_configs().values()]
                                         }
                                     }
                                 ]
@@ -1559,6 +1692,8 @@ class AutoSubv2(_PluginBase):
             "enable_merge": False,
             "enable_batch": True,
             "batch_size": 10,
+            "refresh_enabled": False,
+            "mediaservers": [],
         }
 
     def get_api(self) -> List[Dict[str, Any]]:
