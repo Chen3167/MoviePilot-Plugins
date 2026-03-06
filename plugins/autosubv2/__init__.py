@@ -63,6 +63,7 @@ class TaskItem:
     media_year: int = None
     media_type: str = None
     media_category: str = None
+    target_diritem_path: str = None  # 入库目标目录路径
 
 
 class AutoSubv2(_PluginBase):
@@ -226,6 +227,7 @@ class AutoSubv2(_PluginBase):
                     media_year=task_dict.get("media_year"),
                     media_type=task_dict.get("media_type"),
                     media_category=task_dict.get("media_category"),
+                    target_diritem_path=task_dict.get("target_diritem_path"),
                 )
                 tasks[task_id] = task
             except Exception as e:
@@ -246,6 +248,7 @@ class AutoSubv2(_PluginBase):
             "media_year": task.media_year,
             "media_type": task.media_type,
             "media_category": task.media_category,
+            "target_diritem_path": task.target_diritem_path,
         }
 
     def save_tasks(self):
@@ -273,7 +276,8 @@ class AutoSubv2(_PluginBase):
                 return True
         return False
 
-    def add_task(self, video_file: str, source: TaskSource, media_info: MediaInfo = None):
+    def add_task(self, video_file: str, source: TaskSource, media_info: MediaInfo = None, 
+                 transfer_info: TransferInfo = None):
         """
         添加新任务到队列和任务列表中，若任务已存在则跳过。
         :param video_file: 视频文件路径
@@ -299,6 +303,7 @@ class AutoSubv2(_PluginBase):
                 media_year=media_info.year if media_info else None,
                 media_type=media_info.type.value if media_info and media_info.type else None,
                 media_category=media_info.category if media_info else None,
+                target_diritem_path=transfer_info.target_diritem.path if transfer_info and transfer_info.target_diritem else None,
             )
 
             self._task_queue.put(task)
@@ -386,7 +391,7 @@ class AutoSubv2(_PluginBase):
 
         for file_path in item_file_list:
             if os.path.splitext(file_path)[-1].lower() in settings.RMT_MEDIAEXT:
-                self.add_task(file_path, TaskSource.EVENT, media_info=item_media)
+                self.add_task(file_path, TaskSource.EVENT, media_info=item_media, transfer_info=item_transfer)
 
     def _run_at_once(self, path_list: List[str]):
         # 依次处理每个目录
@@ -494,13 +499,16 @@ class AutoSubv2(_PluginBase):
             
             # 构建刷新项，优先使用任务中保存的媒体信息
             if task and task.media_title:
+                # 优先使用保存的入库目标目录（与官方 MediaServerRefresh 插件一致）
+                target_path = Path(task.target_diritem_path) if task.target_diritem_path else Path(video_file).parent
                 logger.info(f"使用媒体信息: {task.media_title} ({task.media_year}) [{task.media_type}]")
+                logger.info(f"刷新目标路径: {target_path} (来源: {'入库目标目录' if task.target_diritem_path else '视频文件父目录'})")
                 item = RefreshMediaItem(
                     title=task.media_title,
                     year=task.media_year,
                     type=task.media_type,
                     category=task.media_category,
-                    target_path=Path(video_file),
+                    target_path=target_path,
                 )
             else:
                 logger.info(f"未找到媒体信息，使用视频文件路径")
@@ -542,9 +550,9 @@ class AutoSubv2(_PluginBase):
             if not os.path.exists(cache_dir):
                 os.mkdir(cache_dir)
             os.environ["HF_HUB_CACHE"] = cache_dir
-            if self._huggingface_proxy:
-                os.environ["HTTP_PROXY"] = settings.PROXY['http']
-                os.environ["HTTPS_PROXY"] = settings.PROXY['https']
+            if self._huggingface_proxy and settings.PROXY:
+                os.environ["HTTP_PROXY"] = settings.PROXY.get('http', '')
+                os.environ["HTTPS_PROXY"] = settings.PROXY.get('https', '')
             model = WhisperModel(
                 download_model(self._faster_whisper_model, local_files_only=False, cache_dir=cache_dir),
                 device="cpu", compute_type="int8", cpu_threads=psutil.cpu_count(logical=False))
