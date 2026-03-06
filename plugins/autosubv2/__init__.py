@@ -58,6 +58,11 @@ class TaskItem:
     status: TaskStatus = TaskStatus.PENDING
     complete_time: datetime = None
     total_tokens: int = 0
+    # 媒体信息（用于刷新媒体服务器）
+    media_title: str = None
+    media_year: int = None
+    media_type: str = None
+    media_category: str = None
 
 
 class AutoSubv2(_PluginBase):
@@ -217,6 +222,10 @@ class AutoSubv2(_PluginBase):
                     complete_time=datetime.fromisoformat(task_dict["complete_time"])
                     if task_dict.get("complete_time") else None,
                     total_tokens=task_dict.get("total_tokens", 0),
+                    media_title=task_dict.get("media_title"),
+                    media_year=task_dict.get("media_year"),
+                    media_type=task_dict.get("media_type"),
+                    media_category=task_dict.get("media_category"),
                 )
                 tasks[task_id] = task
             except Exception as e:
@@ -233,6 +242,10 @@ class AutoSubv2(_PluginBase):
             "status": task.status.value,
             "complete_time": task.complete_time.isoformat() if task.complete_time else None,
             "total_tokens": task.total_tokens or 0,
+            "media_title": task.media_title,
+            "media_year": task.media_year,
+            "media_type": task.media_type,
+            "media_category": task.media_category,
         }
 
     def save_tasks(self):
@@ -260,11 +273,12 @@ class AutoSubv2(_PluginBase):
                 return True
         return False
 
-    def add_task(self, video_file: str, source: TaskSource):
+    def add_task(self, video_file: str, source: TaskSource, media_info: MediaInfo = None):
         """
         添加新任务到队列和任务列表中，若任务已存在则跳过。
         :param video_file: 视频文件路径
         :param source: 任务来源（手动/事件）
+        :param media_info: 媒体信息（可选，用于刷新媒体服务器）
         """
         # 使用互斥锁防止竞态条件
         with self._add_task_lock:
@@ -280,7 +294,11 @@ class AutoSubv2(_PluginBase):
                 task_id=str(uuid4()),
                 video_file=video_file,
                 source=source,
-                add_time=datetime.now()
+                add_time=datetime.now(),
+                media_title=media_info.title if media_info else None,
+                media_year=media_info.year if media_info else None,
+                media_type=media_info.type.value if media_info and media_info.type else None,
+                media_category=media_info.category if media_info else None,
             )
 
             self._task_queue.put(task)
@@ -332,7 +350,7 @@ class AutoSubv2(_PluginBase):
                 task.status = TaskStatus.IN_PROGRESS
                 self._tasks[task.task_id] = task
                 self.save_tasks()
-                task.status = self.__process_autosub(task.video_file)
+                task.status = self.__process_autosub(task.video_file, task)
                 task.complete_time = datetime.now()
                 # 记录翻译 token 用量
                 if hasattr(self, '_stats') and self._stats:
@@ -368,7 +386,7 @@ class AutoSubv2(_PluginBase):
 
         for file_path in item_file_list:
             if os.path.splitext(file_path)[-1].lower() in settings.RMT_MEDIAEXT:
-                self.add_task(file_path, TaskSource.EVENT)
+                self.add_task(file_path, TaskSource.EVENT, media_info=item_media)
 
     def _run_at_once(self, path_list: List[str]):
         # 依次处理每个目录
@@ -396,7 +414,7 @@ class AutoSubv2(_PluginBase):
             return False
         return True
 
-    def __process_autosub(self, video_file) -> TaskStatus:
+    def __process_autosub(self, video_file, task: TaskItem = None) -> TaskStatus:
         if not video_file:
             return TaskStatus.FAILED
         # 如果文件大小小于指定大小， 则不处理
@@ -441,7 +459,7 @@ class AutoSubv2(_PluginBase):
             if self._send_notify:
                 self.post_message(mtype=NotificationType.Plugin, title="【自动字幕生成】", text=message)
             # 刷新媒体服务器
-            self.__refresh_mediaserver(video_file)
+            self.__refresh_mediaserver(video_file, task)
             return TaskStatus.COMPLETED
         except UserInterruptException:
             logger.info(f"用户中断当前任务：{video_file}")
@@ -456,10 +474,11 @@ class AutoSubv2(_PluginBase):
             logger.error(traceback.format_exc())
             return TaskStatus.FAILED
 
-    def __refresh_mediaserver(self, video_file: str):
+    def __refresh_mediaserver(self, video_file: str, task: TaskItem = None):
         """
         刷新媒体服务器中视频所在的媒体库
         :param video_file: 视频文件路径
+        :param task: 任务对象（包含媒体信息）
         """
         logger.info(f"[刷新检查] refresh_enabled={self._refresh_enabled}, mediaservers={self._mediaservers}")
         if not self._refresh_enabled or not self._mediaservers:
@@ -472,10 +491,24 @@ class AutoSubv2(_PluginBase):
                 logger.warning("获取媒体服务器实例失败，请检查配置")
                 return
             logger.info(f"获取到 {len(services)} 个媒体服务器: {list(services.keys())}")
-            item = RefreshMediaItem(
-                target_path=Path(video_file).parent,
-            )
-            logger.info(f"刷新目标路径: {item.target_path}")
+            
+            # 构建刷新项，优先使用任务中保存的媒体信息
+            if task and task.media_title:
+                logger.info(f"使用媒体信息: {task.media_title} ({task.media_year}) [{task.media_type}]")
+                item = RefreshMediaItem(
+                    title=task.media_title,
+                    year=task.media_year,
+                    type=task.media_type,
+                    category=task.media_category,
+                    target_path=Path(video_file),
+                )
+            else:
+                logger.info(f"未找到媒体信息，使用视频文件路径")
+                item = RefreshMediaItem(
+                    target_path=Path(video_file),
+                )
+            
+            logger.info(f"刷新目标: {item.target_path}")
             for name, service in services.items():
                 if service.instance.is_inactive():
                     logger.warning(f"媒体服务器 {name} 未连接，跳过刷新")
