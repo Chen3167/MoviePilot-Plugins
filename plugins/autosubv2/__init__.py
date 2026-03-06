@@ -70,7 +70,7 @@ class AutoSubv2(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "2.7"
+    plugin_version = "2.8"
     # 插件作者
     plugin_author = "TimoYoung"
     # 作者主页
@@ -189,6 +189,7 @@ class AutoSubv2(_PluginBase):
 
             if not self._running:
                 self._task_queue = queue.Queue()
+                self._add_task_lock = threading.Lock()
                 self._consumer_thread = threading.Thread(target=self._consume_tasks, daemon=True)
                 self._consumer_thread.start()
                 logger.info("任务队列和消费者线程已启动")
@@ -265,26 +266,28 @@ class AutoSubv2(_PluginBase):
         :param video_file: 视频文件路径
         :param source: 任务来源（手动/事件）
         """
-        if self.__is_duplicate_task(video_file):
-            logger.info(f"任务已存在，跳过添加：{video_file}")
-            return False
+        # 使用互斥锁防止竞态条件
+        with self._add_task_lock:
+            if self.__is_duplicate_task(video_file):
+                logger.info(f"任务已存在，跳过添加：{video_file}")
+                return False
 
-        # 已有中文字幕的视频不加入任务队列
-        if self.__has_chinese_subtitle(video_file):
-            return False
+            # 已有中文字幕的视频不加入任务队列
+            if self.__has_chinese_subtitle(video_file):
+                return False
 
-        task = TaskItem(
-            task_id=str(uuid4()),
-            video_file=video_file,
-            source=source,
-            add_time=datetime.now()
-        )
+            task = TaskItem(
+                task_id=str(uuid4()),
+                video_file=video_file,
+                source=source,
+                add_time=datetime.now()
+            )
 
-        self._task_queue.put(task)
-        self._tasks[task.task_id] = task
-        self.save_tasks()
-        logger.info(f"加入任务队列: {video_file}")
-        return True
+            self._task_queue.put(task)
+            self._tasks[task.task_id] = task
+            self.save_tasks()
+            logger.info(f"加入任务队列: {video_file}")
+            return True
 
     def clear_tasks(self):
         self._tasks = {task_id: task for task_id, task in self._tasks.items() if task.status in [
@@ -293,14 +296,29 @@ class AutoSubv2(_PluginBase):
         self.save_tasks()
         logger.info("插件历史任务已清除")
 
-    def __is_duplicate_task(self, video_file: str) -> bool:
+    def __is_duplicate_task(self, video_file: str, time_window_hours: int = 2) -> bool:
+        """
+        检查任务是否重复
+        :param video_file: 视频文件路径
+        :param time_window_hours: 时间窗口（小时），在此时间内的相同任务视为重复
+        :return: True 表示任务重复
+        """
+        # 1. 检查队列中的任务
         with self._task_queue.mutex:
             for task in self._task_queue.queue:
                 if task.video_file == video_file:
                     return True
-            # 还要检查当前正在处理的任务（即可能不在队列中，但正在被消费）
+            # 2. 检查当前正在处理的任务
             if self._consumer_thread and self._current_processing_task and self._current_processing_task.video_file == video_file:
                 return True
+        
+        # 3. 检查最近时间窗口内的历史任务
+        cutoff_time = datetime.now() - timedelta(hours=time_window_hours)
+        for task in self._tasks.values():
+            if task.video_file == video_file and task.add_time > cutoff_time:
+                logger.debug(f"任务在 {time_window_hours} 小时内已存在（添加时间: {task.add_time.strftime('%Y-%m-%d %H:%M:%S')}），跳过：{video_file}")
+                return True
+        
         return False
 
     def _consume_tasks(self):
