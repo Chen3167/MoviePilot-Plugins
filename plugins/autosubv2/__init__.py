@@ -1022,6 +1022,7 @@ class AutoSubv2(_PluginBase):
         self._stats['total'] = len(valid_subs)
         processed = []
         current_batch = []
+        last_tokens = 0  # 记录上一次的 token 总量
 
         for item in valid_subs:
             current_batch.append(item)
@@ -1029,7 +1030,10 @@ class AutoSubv2(_PluginBase):
             if len(current_batch) >= self._batch_size:
                 processed += self.__process_items(valid_subs, current_batch)
                 current_batch = []
-                logger.info(f"进度: {len(processed)}/{len(valid_subs)}, Token用量: {self._stats['total_tokens']}")
+                # 计算本批次用量
+                batch_tokens = self._stats['total_tokens'] - last_tokens
+                logger.info(f"进度: {len(processed)}/{len(valid_subs)}, 本批次Token: {batch_tokens}, 累计Token: {self._stats['total_tokens']}")
+                last_tokens = self._stats['total_tokens']
 
         if current_batch:
             processed += self.__process_items(valid_subs, current_batch)
