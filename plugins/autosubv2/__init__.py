@@ -479,6 +479,10 @@ class AutoSubv2(_PluginBase):
                     logger.info(f"开始翻译字幕为中文 ...")
                     self.__translate_zh_subtitle(lang, gen_sub_path, f"{file_path}.zh.机翻.srt")
                     logger.info(f"翻译字幕完成：{file_name}.zh.机翻.srt")
+                    # 删除原始语言字幕文件，只保留中文翻译
+                    if os.path.exists(gen_sub_path):
+                        os.remove(gen_sub_path)
+                        logger.info(f"已删除原始字幕文件：{gen_sub_path}")
 
             end_time = time.time()
             message = f" 媒体: {file_name}\n 处理完成\n 字幕原始语言: {lang}\n "
