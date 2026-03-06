@@ -294,9 +294,12 @@ class AutoSubv2(_PluginBase):
         
         # 检查内嵌字幕（任意语言）
         video_meta = Ffmpeg().get_video_metadata(video_file)
-        if video_meta and video_meta.get('subtitle'):
-            logger.info(f"已存在内嵌字幕，跳过：{video_file}")
-            return True
+        if video_meta:
+            # 从 streams 中查找字幕流
+            subtitle_streams = [s for s in video_meta.get('streams', []) if s.get('codec_type') == 'subtitle']
+            if subtitle_streams:
+                logger.info(f"已存在内嵌字幕（共{len(subtitle_streams)}个字幕轨道），跳过：{video_file}")
+                return True
         
         return False
 
