@@ -276,6 +276,28 @@ class AutoSubv2(_PluginBase):
                 return True
         return False
 
+    def __has_any_subtitle(self, video_file: str) -> bool:
+        """
+        检查视频是否有任何可用字幕（外挂或内嵌，不限语言）
+        :param video_file: 视频文件路径
+        :return: 存在字幕返回True
+        """
+        # 检查外挂字幕（任意语言）
+        video_dir = os.path.dirname(video_file)
+        video_name = os.path.splitext(os.path.basename(video_file))[0]
+        for file in os.listdir(video_dir):
+            if file.startswith(video_name) and file.endswith('.srt'):
+                logger.info(f"已存在外挂字幕，跳过：{video_file}")
+                return True
+        
+        # 检查内嵌字幕（任意语言）
+        video_meta = Ffmpeg().get_video_metadata(video_file)
+        if video_meta and video_meta.get('subtitle'):
+            logger.info(f"已存在内嵌字幕，跳过：{video_file}")
+            return True
+        
+        return False
+
     def add_task(self, video_file: str, source: TaskSource, media_info: MediaInfo = None, 
                  transfer_info: TransferInfo = None):
         """
@@ -292,6 +314,11 @@ class AutoSubv2(_PluginBase):
 
             # 已有中文字幕的视频不加入任务队列
             if self.__has_chinese_subtitle(video_file):
+                return False
+
+            # 如果未开启ASR，且视频没有任何字幕，则跳过
+            if not self._enable_asr and not self.__has_any_subtitle(video_file):
+                logger.info(f"未开启语音识别且无可用字幕，跳过：{video_file}")
                 return False
 
             task = TaskItem(
