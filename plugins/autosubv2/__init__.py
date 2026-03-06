@@ -76,7 +76,7 @@ class AutoSubv2(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "2.8"
+    plugin_version = "2.9"
     # 插件作者
     plugin_author = "TimoYoung"
     # 作者主页
@@ -108,6 +108,7 @@ class AutoSubv2(_PluginBase):
     _path_list = None
     _file_size = None
     _translate_zh = None
+    _subtitle_format = None
     _openai = None
     _enable_batch = None
     _batch_size = None
@@ -145,6 +146,7 @@ class AutoSubv2(_PluginBase):
             self._huggingface_proxy = config.get('proxy', True)
             self._auto_detect_language = config.get('auto_detect_language', False)
         self._translate_zh = config.get('translate_zh', False)
+        self._subtitle_format = config.get('subtitle_format', 'bilingual')
         if self._translate_zh:
             use_chatgpt = config.get('use_chatgpt', True)
             if use_chatgpt:
@@ -1037,7 +1039,7 @@ class AutoSubv2(_PluginBase):
                 raise Exception(f"批次行数不匹配 {len(translated)}/{len(batch)}")
 
             for item, trans in zip(batch, translated):
-                item.content = f"{trans}\n{item.content}"
+                item.content = self.__format_subtitle_content(trans, item.content)
             self._stats['batch_success'] += len(batch)
             return batch
         except Exception as e:
@@ -1076,12 +1078,32 @@ class AutoSubv2(_PluginBase):
         success, trans = self.__translate_to_zh(item.content, context)
 
         if success:
-            item.content = f"{trans}\n{item.content}"
+            item.content = self.__format_subtitle_content(trans, item.content)
             self._stats['line_fallback'] += 1
             return item
         else:
             item.content = f"[翻译失败]\n{item.content}"
             return item
+
+    def __format_subtitle_content(self, translated: str, original: str) -> str:
+        """
+        根据配置格式化字幕内容
+        :param translated: 翻译后的文本
+        :param original: 原始文本
+        :return: 格式化后的字幕内容
+        """
+        if self._subtitle_format == 'chinese_only':
+            # 仅中文
+            return translated
+        elif self._subtitle_format == 'bilingual':
+            # 中英双语（中文在上，原文在下）
+            return f"{translated}\n{original}"
+        elif self._subtitle_format == 'chinese_original':
+            # 中文+原始语言（中文在上，原文在下）
+            return f"{translated}\n{original}"
+        else:
+            # 默认双语
+            return f"{translated}\n{original}"
 
     def __translate_zh_subtitle(self, source_lang: str, source_subtitle: str, dest_subtitle: str):
         self._stats = {'total': 0, 'batch_success': 0, 'batch_fail': 0, 'line_fallback': 0,
@@ -1402,6 +1424,25 @@ class AutoSubv2(_PluginBase):
                                             'model': 'translate_zh',
                                             'label': '翻译成中文',
                                             'hint': '使用大模型翻译成中文字幕'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4, 'v-show': 'translate_zh'},
+                                'content': [
+                                    {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'model': 'subtitle_format',
+                                            'label': '字幕格式',
+                                            'hint': '翻译后的字幕显示格式',
+                                            'items': [
+                                                {'title': '仅中文', 'value': 'chinese_only'},
+                                                {'title': '中英双语', 'value': 'bilingual'},
+                                                {'title': '中文+原始语言', 'value': 'chinese_original'}
+                                            ]
                                         }
                                     }
                                 ]
@@ -1798,6 +1839,7 @@ class AutoSubv2(_PluginBase):
             "file_size": "10",
             "translate_preference": "english_first",
             "translate_zh": False,
+            "subtitle_format": "bilingual",
             "enable_asr": True,
             "auto_detect_language": False,
             "faster_whisper_model": "base",
