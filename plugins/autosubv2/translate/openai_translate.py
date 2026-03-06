@@ -115,6 +115,22 @@ class OpenAi:
         if OpenAISessionCache.get(session_id):
             OpenAISessionCache.delete(session_id)
 
+    @staticmethod
+    def __extract_usage(completion) -> dict:
+        """
+        从 completion 响应中安全提取 token 用量
+        :param completion: OpenAI API 响应
+        :return: {'prompt_tokens': int, 'completion_tokens': int, 'total_tokens': int}
+        """
+        usage = getattr(completion, 'usage', None)
+        if usage:
+            return {
+                'prompt_tokens': getattr(usage, 'prompt_tokens', 0) or 0,
+                'completion_tokens': getattr(usage, 'completion_tokens', 0) or 0,
+                'total_tokens': getattr(usage, 'total_tokens', 0) or 0,
+            }
+        return {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
+
     def translate_to_zh_batch(self, text: str, context: str = None, max_retries: int = 3):
         """
         批量翻译为中文（编号标记格式）
@@ -140,7 +156,8 @@ class OpenAi:
                                               temperature=0.2,
                                               top_p=0.9)
                 result = completion.choices[0].message.content.strip()
-                return True, result
+                usage = self.__extract_usage(completion)
+                return True, result, usage
             except Exception as e:
                 last_error = str(e)
                 if attempt < max_retries:
@@ -151,7 +168,7 @@ class OpenAi:
                     time.sleep(sleep_time)
                 else:
                     print(f"批量翻译请求失败 (已重试{max_retries}次)：{last_error}")
-                    return False, f"{last_error}"
+                    return False, f"{last_error}", None
 
     def translate_to_zh(self, text: str, context: str = None, max_retries: int = 3):
         """
@@ -176,7 +193,8 @@ class OpenAi:
                                               temperature=0.2,
                                               top_p=0.9)
                 result = completion.choices[0].message.content.strip()
-                return True, result
+                usage = self.__extract_usage(completion)
+                return True, result, usage
             except Exception as e:
                 last_error = str(e)
                 if attempt < max_retries:
@@ -188,4 +206,4 @@ class OpenAi:
                     time.sleep(sleep_time)
                 else:
                     print(f"翻译请求失败 (已重试{max_retries}次)：{last_error}")
-                    return False, f"{last_error}"
+                    return False, f"{last_error}", None

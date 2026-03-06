@@ -57,6 +57,7 @@ class TaskItem:
     add_time: datetime
     status: TaskStatus = TaskStatus.PENDING
     complete_time: datetime = None
+    total_tokens: int = 0
 
 
 class AutoSubv2(_PluginBase):
@@ -69,7 +70,7 @@ class AutoSubv2(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "2.6"
+    plugin_version = "2.7"
     # 插件作者
     plugin_author = "TimoYoung"
     # 作者主页
@@ -214,6 +215,7 @@ class AutoSubv2(_PluginBase):
                     status=TaskStatus(task_dict["status"]),
                     complete_time=datetime.fromisoformat(task_dict["complete_time"])
                     if task_dict.get("complete_time") else None,
+                    total_tokens=task_dict.get("total_tokens", 0),
                 )
                 tasks[task_id] = task
             except Exception as e:
@@ -229,6 +231,7 @@ class AutoSubv2(_PluginBase):
             "add_time": task.add_time.isoformat() if task.add_time else None,
             "status": task.status.value,
             "complete_time": task.complete_time.isoformat() if task.complete_time else None,
+            "total_tokens": task.total_tokens or 0,
         }
 
     def save_tasks(self):
@@ -313,6 +316,9 @@ class AutoSubv2(_PluginBase):
                 self.save_tasks()
                 task.status = self.__process_autosub(task.video_file)
                 task.complete_time = datetime.now()
+                # 记录翻译 token 用量
+                if hasattr(self, '_stats') and self._stats:
+                    task.total_tokens = self._stats.get('total_tokens', 0)
                 self._tasks[task.task_id] = task
                 self.save_tasks()
                 self._task_queue.task_done()
@@ -410,6 +416,8 @@ class AutoSubv2(_PluginBase):
             message = f" 媒体: {file_name}\n 处理完成\n 字幕原始语言: {lang}\n "
             if self._translate_zh:
                 message += f"字幕翻译语言: zh\n "
+                if hasattr(self, '_stats') and self._stats.get('total_tokens'):
+                    message += f"Token用量: {self._stats['total_tokens']}\n "
             message += f"耗时：{round(end_time - start_time, 2)}秒"
             logger.info(f"自动字幕生成 处理完成：{message}")
             if self._send_notify:
@@ -900,10 +908,15 @@ class AutoSubv2(_PluginBase):
             return self.__process_batch(all_subs, items)
         return [self.__process_single(all_subs, item) for item in items]
 
-    def __translate_to_zh(self, text: str, context: str = None) -> str:
+    def __translate_to_zh(self, text: str, context: str = None) -> tuple:
         if self._event.is_set():
             raise UserInterruptException("用户中断当前任务")
-        return self._openai.translate_to_zh(text, context, max_retries=self._max_retries)
+        ret, result, usage = self._openai.translate_to_zh(text, context, max_retries=self._max_retries)
+        if usage:
+            self._stats['prompt_tokens'] += usage.get('prompt_tokens', 0)
+            self._stats['completion_tokens'] += usage.get('completion_tokens', 0)
+            self._stats['total_tokens'] += usage.get('total_tokens', 0)
+        return ret, result
 
     def __process_batch(self, all_subs: list, batch: list) -> list:
         """批量处理逻辑（使用编号标记格式）"""
@@ -938,7 +951,12 @@ class AutoSubv2(_PluginBase):
         """批量翻译（使用编号标记格式）"""
         if self._event.is_set():
             raise UserInterruptException("用户中断当前任务")
-        return self._openai.translate_to_zh_batch(text, context, max_retries=self._max_retries)
+        ret, result, usage = self._openai.translate_to_zh_batch(text, context, max_retries=self._max_retries)
+        if usage:
+            self._stats['prompt_tokens'] += usage.get('prompt_tokens', 0)
+            self._stats['completion_tokens'] += usage.get('completion_tokens', 0)
+            self._stats['total_tokens'] += usage.get('total_tokens', 0)
+        return ret, result
 
     @staticmethod
     def __parse_numbered_result(result: str, expected_count: int) -> list:
@@ -968,7 +986,8 @@ class AutoSubv2(_PluginBase):
             return item
 
     def __translate_zh_subtitle(self, source_lang: str, source_subtitle: str, dest_subtitle: str):
-        self._stats = {'total': 0, 'batch_success': 0, 'batch_fail': 0, 'line_fallback': 0}
+        self._stats = {'total': 0, 'batch_success': 0, 'batch_fail': 0, 'line_fallback': 0,
+                       'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
         subs = self.__load_srt(source_subtitle)
         if source_lang in ["en", "eng"] and self._enable_merge:
             valid_subs = self.__merge_srt(subs)
@@ -992,7 +1011,7 @@ class AutoSubv2(_PluginBase):
             if len(current_batch) >= self._batch_size:
                 processed += self.__process_items(valid_subs, current_batch)
                 current_batch = []
-                logger.info(f"进度: {len(processed)}/{len(valid_subs)}")
+                logger.info(f"进度: {len(processed)}/{len(valid_subs)}, Token用量: {self._stats['total_tokens']}")
 
         if current_batch:
             processed += self.__process_items(valid_subs, current_batch)
@@ -1007,6 +1026,7 @@ class AutoSubv2(_PluginBase):
     批次成功: {self._stats['batch_success']} ({success_rate:.1f}%)
     批次失败: {self._stats['batch_fail']}
     行补偿翻译: {self._stats['line_fallback']}
+    Token用量: {self._stats['total_tokens']} (提示: {self._stats['prompt_tokens']}, 补全: {self._stats['completion_tokens']})
             """)
 
     @staticmethod
@@ -1752,6 +1772,7 @@ class AutoSubv2(_PluginBase):
                         "props": {"class": status_class},
                         "text": status_text
                     },
+                    {"component": "td", "text": str(task.total_tokens) if task.total_tokens else "-"},
                 ],
             })
 
@@ -1794,6 +1815,11 @@ class AutoSubv2(_PluginBase):
                                                 "component": "th",
                                                 "props": {"class": "text-start ps-4"},
                                                 "text": "状态"
+                                            },
+                                            {
+                                                "component": "th",
+                                                "props": {"class": "text-start ps-4"},
+                                                "text": "Token"
                                             },
                                         ]
                                     },
