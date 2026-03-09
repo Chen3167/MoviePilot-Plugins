@@ -98,6 +98,8 @@ class AutoSubv2(_PluginBase):
     _consumer_thread = None
     _current_processing_task = None
     _running = False
+    _pending_tasks: Dict[str, threading.Timer] = {}  # 延迟入库的待处理任务
+    _pending_tasks_lock = threading.Lock()  # 保护 _pending_tasks 的锁
     _event = Event()
     _enabled = None
     _clear_history = None
@@ -128,6 +130,11 @@ class AutoSubv2(_PluginBase):
         if not config:
             return
         self._tasks = self.load_tasks()
+        # 初始化延迟任务字典
+        if not hasattr(self, '_pending_tasks'):
+            self._pending_tasks = {}
+        if not hasattr(self, '_pending_tasks_lock'):
+            self._pending_tasks_lock = threading.Lock()
         self._enabled = config.get('enabled', False)
         self._clear_history = config.get('clear_history', False)
         self._listen_transfer_event = config.get('listen_transfer_event', True)
@@ -304,13 +311,19 @@ class AutoSubv2(_PluginBase):
         return False
 
     def add_task(self, video_file: str, source: TaskSource, media_info: MediaInfo = None, 
-                 transfer_info: TransferInfo = None):
+                 transfer_info: TransferInfo = None, delay_seconds: int = 0):
         """
         添加新任务到队列和任务列表中，若任务已存在则跳过。
         :param video_file: 视频文件路径
         :param source: 任务来源（手动/事件）
         :param media_info: 媒体信息（可选，用于刷新媒体服务器）
+        :param delay_seconds: 延迟入库秒数，用于防止短时间内重复触发
         """
+        # 如果设置了延迟，使用延迟入库机制
+        if delay_seconds > 0:
+            self.__add_task_with_delay(video_file, source, media_info, transfer_info, delay_seconds)
+            return True
+        
         # 使用互斥锁防止竞态条件
         with self._add_task_lock:
             if self.__is_duplicate_task(video_file):
@@ -344,6 +357,37 @@ class AutoSubv2(_PluginBase):
             logger.info(f"加入任务队列: {video_file}")
             return True
 
+    def __add_task_with_delay(self, video_file: str, source: TaskSource, 
+                             media_info: MediaInfo = None, transfer_info: TransferInfo = None, 
+                             delay_seconds: int = 5):
+        """
+        延迟添加任务，防止短时间内重复触发
+        :param video_file: 视频文件路径
+        :param source: 任务来源
+        :param media_info: 媒体信息
+        :param transfer_info: 转移信息
+        :param delay_seconds: 延迟秒数
+        """
+        with self._pending_tasks_lock:
+            # 如果已有该文件的延迟任务，取消旧的定时器
+            if video_file in self._pending_tasks:
+                old_timer = self._pending_tasks[video_file]
+                old_timer.cancel()
+                logger.debug(f"取消旧的延迟任务，重新计时：{video_file}")
+            
+            # 创建新的延迟任务
+            def delayed_add():
+                with self._pending_tasks_lock:
+                    if video_file in self._pending_tasks:
+                        del self._pending_tasks[video_file]
+                logger.info(f"延迟 {delay_seconds} 秒后执行任务添加：{video_file}")
+                self.add_task(video_file, source, media_info, transfer_info, delay_seconds=0)
+            
+            timer = threading.Timer(delay_seconds, delayed_add)
+            self._pending_tasks[video_file] = timer
+            timer.start()
+            logger.debug(f"任务已加入延迟队列（{delay_seconds}秒）：{video_file}")
+
     def clear_tasks(self):
         self._tasks = {task_id: task for task_id, task in self._tasks.items() if task.status in [
             TaskStatus.PENDING, TaskStatus.IN_PROGRESS
@@ -351,11 +395,10 @@ class AutoSubv2(_PluginBase):
         self.save_tasks()
         logger.info("插件历史任务已清除")
 
-    def __is_duplicate_task(self, video_file: str, time_window_hours: int = 2) -> bool:
+    def __is_duplicate_task(self, video_file: str) -> bool:
         """
-        检查任务是否重复
+        检查任务是否重复（仅检查队列和当前处理中的任务）
         :param video_file: 视频文件路径
-        :param time_window_hours: 时间窗口（小时），在此时间内的相同任务视为重复
         :return: True 表示任务重复
         """
         # 1. 检查队列中的任务
@@ -367,11 +410,9 @@ class AutoSubv2(_PluginBase):
             if self._consumer_thread and self._current_processing_task and self._current_processing_task.video_file == video_file:
                 return True
         
-        # 3. 检查最近时间窗口内的历史任务
-        cutoff_time = datetime.now() - timedelta(hours=time_window_hours)
-        for task in self._tasks.values():
-            if task.video_file == video_file and task.add_time > cutoff_time:
-                logger.debug(f"任务在 {time_window_hours} 小时内已存在（添加时间: {task.add_time.strftime('%Y-%m-%d %H:%M:%S')}），跳过：{video_file}")
+        # 3. 检查延迟入库的待处理任务
+        with self._pending_tasks_lock:
+            if video_file in self._pending_tasks:
                 return True
         
         return False
@@ -423,7 +464,9 @@ class AutoSubv2(_PluginBase):
 
         for file_path in item_file_list:
             if os.path.splitext(file_path)[-1].lower() in settings.RMT_MEDIAEXT:
-                self.add_task(file_path, TaskSource.EVENT, media_info=item_media, transfer_info=item_transfer)
+                # 使用延迟入库机制，防止短时间内重复触发（延迟30秒）
+                self.add_task(file_path, TaskSource.EVENT, media_info=item_media, 
+                            transfer_info=item_transfer, delay_seconds=30)
 
     def _run_at_once(self, path_list: List[str]):
         # 依次处理每个目录
@@ -1999,6 +2042,16 @@ class AutoSubv2(_PluginBase):
             logger.info("正在停止当前任务...")
             # self._consumer_thread.join(timeout=3)
             self._consumer_thread.join()
+
+        # 取消所有延迟任务
+        with self._pending_tasks_lock:
+            pending_count = len(self._pending_tasks)
+            for video_file, timer in list(self._pending_tasks.items()):
+                timer.cancel()
+                logger.debug(f"取消延迟任务：{video_file}")
+            self._pending_tasks.clear()
+            if pending_count > 0:
+                logger.info(f"已取消 {pending_count} 个延迟任务")
 
         if self._task_queue:
             while not self._task_queue.empty():
